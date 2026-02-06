@@ -604,10 +604,35 @@ def monitor_chat(
                     log.info(f"📬 检测到未读消息变化: {last_badge} → {current_badge}")
                     last_badge = current_badge
 
+                # ---- 处理新聊天窗口 ----
+                chat_targets = []
                 for win_name in new_windows:
                     if not win_name or win_name in ("QQ", "全网搜索"):
                         continue
+                    chat_targets.append(("new_chat_window", win_name, current_windows.get(win_name)))
 
+                # ---- 徽章增加但无新窗口：点击主面板打开最新未读聊天 ----
+                if badge_increased and not new_windows and auto_reply:
+                    log.info("  尝试打开最新未读聊天...")
+                    activate_qq()
+                    time.sleep(0.3)
+                    qq_win = get_qq_window_info()
+                    if qq_win:
+                        # 点击主面板第一个聊天项（顶部约130px处，第一个对话）
+                        chat_x = qq_win["x"] + qq_win["width"] // 2
+                        chat_y = qq_win["y"] + 130
+                        pyautogui.click(chat_x, chat_y)
+                        time.sleep(0.3)
+                        # 双击打开聊天窗口
+                        pyautogui.click(chat_x, chat_y)
+                        time.sleep(1)
+                        # 检查是否打开了新窗口
+                        chat_win = find_chat_window()
+                        if chat_win and chat_win["name"] not in replied_windows:
+                            chat_targets.append(("badge_trigger", chat_win["name"], chat_win))
+
+                # ---- 对每个目标执行回复 ----
+                for event_type, win_name, win_data in chat_targets:
                     # 如果指定了目标，只响应目标联系人
                     if target and target not in win_name:
                         log.info(f"  忽略非目标窗口: {win_name}")
@@ -624,7 +649,7 @@ def monitor_chat(
                     event = {
                         "timestamp": datetime.now().isoformat(),
                         "sender": win_name,
-                        "type": "new_chat_window",
+                        "type": event_type,
                         "replied": False,
                     }
 
