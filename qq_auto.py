@@ -115,21 +115,51 @@ def launch_qq():
     time.sleep(2)
 
 
-def get_qq_window_info() -> dict:
-    """获取 QQ 主窗口的位置和大小"""
-    script = f'''
-    tell application "System Events"
-        tell process "{QQ_APP_NAME}"
-            set frontWindow to front window
-            set winPos to position of frontWindow
-            set winSize to size of frontWindow
-            return (item 1 of winPos) & "," & (item 2 of winPos) & "," & (item 1 of winSize) & "," & (item 2 of winSize)
+def get_qq_window_info(window_name=None) -> dict:
+    """获取 QQ 窗口的位置和大小
+    
+    Args:
+        window_name: 指定窗口名称，None 则尝试获取主面板 "QQ" 窗口，
+                     找不到则返回 front window
+    """
+    if window_name:
+        script = f'''
+        tell application "System Events"
+            tell process "{QQ_APP_NAME}"
+                set w to window "{window_name}"
+                set winPos to position of w
+                set winSize to size of w
+                set x to item 1 of winPos as integer
+                set y to item 2 of winPos as integer
+                set ww to item 1 of winSize as integer
+                set hh to item 2 of winSize as integer
+                return (x as text) & "|" & (y as text) & "|" & (ww as text) & "|" & (hh as text)
+            end tell
         end tell
-    end tell
-    '''
+        '''
+    else:
+        # 优先找名为 "QQ" 的主面板窗口
+        script = f'''
+        tell application "System Events"
+            tell process "{QQ_APP_NAME}"
+                try
+                    set w to window "QQ"
+                on error
+                    set w to front window
+                end try
+                set winPos to position of w
+                set winSize to size of w
+                set x to item 1 of winPos as integer
+                set y to item 2 of winPos as integer
+                set ww to item 1 of winSize as integer
+                set hh to item 2 of winSize as integer
+                return (x as text) & "|" & (y as text) & "|" & (ww as text) & "|" & (hh as text)
+            end tell
+        end tell
+        '''
     result = run_applescript(script)
     if result:
-        parts = result.split(",")
+        parts = result.split("|")
         if len(parts) == 4:
             return {
                 "x": int(parts[0]),
@@ -199,23 +229,78 @@ def screenshot_qq_window(filename=None) -> str:
 # 消息操作
 # ============================================================
 
-def type_text_via_applescript(text: str):
-    """通过 AppleScript 输入文字（支持中文）"""
-    # 先将文字写入剪贴板，再粘贴（最可靠的中文输入方式）
-    script = f'''
-    set the clipboard to "{text}"
+def check_accessibility() -> bool:
+    """检查是否有辅助功能权限"""
+    script = '''
     tell application "System Events"
-        tell process "{QQ_APP_NAME}"
-            keystroke "v" using command down
-        end tell
+        keystroke ""
     end tell
     '''
-    run_applescript(script)
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True, text=True, timeout=5
+    )
+    return result.returncode == 0
+
+
+def set_clipboard(text: str):
+    """通过 pbcopy 设置剪贴板内容（不需要辅助功能权限）"""
+    process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+    process.communicate(text.encode("utf-8"))
+
+
+def send_keystroke(key: str, modifiers: list = None):
+    """发送按键事件
+    
+    优先使用 AppleScript，如果权限不足则提示用户。
+    key: 按键名称或字符
+    modifiers: 修饰键列表，如 ['command'], ['command', 'shift']
+    """
+    if modifiers and 'command' in modifiers:
+        mod_str = ' using command down'
+    else:
+        mod_str = ''
+    
+    # 对于回车键使用 key code
+    if key == 'return':
+        script = f'''
+        tell application "System Events"
+            tell process "{QQ_APP_NAME}"
+                key code 36{mod_str}
+            end tell
+        end tell
+        '''
+    else:
+        script = f'''
+        tell application "System Events"
+            tell process "{QQ_APP_NAME}"
+                keystroke "{key}"{mod_str}
+            end tell
+        end tell
+        '''
+    
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True, text=True, timeout=5
+    )
+    if result.returncode != 0 and "1002" in result.stderr:
+        log.error("缺少辅助功能权限！请前往: 系统设置 → 隐私与安全性 → 辅助功能 → 添加当前终端/IDE")
+        raise PermissionError("缺少辅助功能权限 (Accessibility permission)")
+    return result.returncode == 0
+
+
+def paste_text(text: str):
+    """通过剪贴板粘贴文字（支持中文）"""
+    set_clipboard(text)
+    time.sleep(0.1)
+    send_keystroke("v", modifiers=["command"])
     time.sleep(0.3)
 
 
 def send_message(message: str, dry_run: bool = False) -> dict:
     """在当前 QQ 聊天窗口发送消息
+    
+    优先查找已打开的聊天窗口，点击其输入区域，粘贴消息并发送。
     
     Args:
         message: 要发送的消息文本
@@ -234,43 +319,49 @@ def send_message(message: str, dry_run: bool = False) -> dict:
     activate_qq()
     time.sleep(0.3)
     
-    # 截图记录发送前状态
-    take_screenshot(filename="before_send.png")
-    
-    # 点击输入框区域（QQ 聊天窗口底部）
-    win_info = get_qq_window_info()
-    if win_info:
-        # 点击输入框（通常在窗口底部 1/4 处）
-        input_x = win_info["x"] + win_info["width"] // 2
-        input_y = win_info["y"] + int(win_info["height"] * 0.85)
+    # 查找已打开的聊天窗口
+    chat_win = find_chat_window()
+    if chat_win:
+        log.info(f"使用聊天窗口: {chat_win['name']}")
+        raise_window(chat_win["name"])
+        time.sleep(0.3)
+        # 点击聊天窗口的输入区域（底部约85%处）
+        input_x = chat_win["x"] + chat_win["width"] // 2
+        input_y = chat_win["y"] + int(chat_win["height"] * 0.85)
         pyautogui.click(input_x, input_y)
         time.sleep(0.3)
+        result["chat_window"] = chat_win["name"]
+    else:
+        log.warning("未找到聊天窗口，尝试在当前焦点窗口发送")
+        win_info = get_qq_window_info()
+        if win_info:
+            input_x = win_info["x"] + win_info["width"] // 2
+            input_y = win_info["y"] + int(win_info["height"] * 0.85)
+            pyautogui.click(input_x, input_y)
+            time.sleep(0.3)
     
     # 输入消息
     log.info(f"输入消息: {message[:50]}{'...' if len(message) > 50 else ''}")
-    type_text_via_applescript(message)
+    try:
+        paste_text(message)
+    except PermissionError:
+        result["error"] = "缺少辅助功能权限"
+        return result
     time.sleep(0.2)
     
     if dry_run:
         log.info("[DRY RUN] 消息已输入但未发送")
-        take_screenshot(filename="dry_run_typed.png")
         result["success"] = True
         result["status"] = "typed_not_sent"
         return result
     
     # 按回车发送
-    script = f'''
-    tell application "System Events"
-        tell process "{QQ_APP_NAME}"
-            key code 36
-        end tell
-    end tell
-    '''
-    run_applescript(script)
+    try:
+        send_keystroke("return")
+    except PermissionError:
+        result["error"] = "缺少辅助功能权限，消息已输入但无法发送"
+        return result
     time.sleep(0.5)
-    
-    # 截图记录发送后状态
-    take_screenshot(filename="after_send.png")
     
     log.info("消息已发送")
     result["success"] = True
@@ -278,8 +369,73 @@ def send_message(message: str, dry_run: bool = False) -> dict:
     return result
 
 
+def get_qq_windows() -> list:
+    """获取所有 QQ 窗口信息列表"""
+    script = f'''
+    tell application "System Events"
+        tell process "{QQ_APP_NAME}"
+            set winInfo to {{}}
+            repeat with w in every window
+                set wName to name of w
+                set wPos to position of w
+                set wSize to size of w
+                set x to item 1 of wPos as integer
+                set y to item 2 of wPos as integer
+                set ww to item 1 of wSize as integer
+                set hh to item 2 of wSize as integer
+                set end of winInfo to wName & ":" & (x as text) & "|" & (y as text) & "|" & (ww as text) & "|" & (hh as text)
+            end repeat
+            set AppleScript's text item delimiters to ";;;"
+            return winInfo as text
+        end tell
+    end tell
+    '''
+    result = run_applescript(script)
+    windows = []
+    if result:
+        for item in result.split(";;;"):
+            item = item.strip()
+            if ":" in item:
+                name, coords = item.split(":", 1)
+                parts = coords.split("|")
+                if len(parts) == 4:
+                    windows.append({
+                        "name": name.strip(),
+                        "x": int(parts[0]),
+                        "y": int(parts[1]),
+                        "width": int(parts[2]),
+                        "height": int(parts[3]),
+                    })
+    return windows
+
+
+def find_chat_window() -> dict:
+    """查找已打开的 QQ 聊天窗口（非主面板）"""
+    windows = get_qq_windows()
+    for w in windows:
+        # 聊天窗口通常有联系人名称，且不叫 "QQ" 或 "全网搜索"
+        if w["name"] and w["name"] not in ("", "QQ", "全网搜索"):
+            return w
+    return None
+
+
+def raise_window(window_name: str):
+    """将指定窗口提到最前"""
+    script = f'''
+    tell application "System Events"
+        tell process "{QQ_APP_NAME}"
+            perform action "AXRaise" of window "{window_name}"
+        end tell
+    end tell
+    '''
+    run_applescript(script)
+    time.sleep(0.3)
+
+
 def search_contact(name: str) -> dict:
     """搜索联系人/群聊并打开对话
+    
+    QQ NT 搜索流程：点击主面板搜索区域 → 粘贴名称 → 回车打开聊天窗口
     
     Args:
         name: 联系人或群聊名称
@@ -297,40 +453,48 @@ def search_contact(name: str) -> dict:
     activate_qq()
     time.sleep(0.5)
     
-    # Command+F 打开搜索（QQ macOS 的搜索快捷键）
-    script = f'''
-    tell application "System Events"
-        tell process "{QQ_APP_NAME}"
-            keystroke "f" using command down
-        end tell
-    end tell
-    '''
-    run_applescript(script)
+    # 获取 QQ 主面板窗口位置
+    win_info = get_qq_window_info()
+    if not win_info:
+        log.error("无法获取 QQ 窗口信息")
+        result["error"] = "无法获取 QQ 窗口信息"
+        return result
+    
+    # 点击搜索区域（QQ NT 主面板顶部搜索框）
+    search_x = win_info["x"] + win_info["width"] // 2
+    search_y = win_info["y"] + 70  # 搜索框通常在顶部约70px处
+    log.info(f"点击搜索区域: ({search_x}, {search_y})")
+    pyautogui.click(search_x, search_y)
     time.sleep(0.5)
     
-    # 输入搜索内容
+    # 粘贴搜索内容
     log.info(f"搜索联系人: {name}")
-    type_text_via_applescript(name)
+    try:
+        paste_text(name)
+    except PermissionError:
+        result["error"] = "缺少辅助功能权限"
+        return result
     time.sleep(1)
     
-    # 截图搜索结果
-    take_screenshot(filename="search_result.png")
+    # 按回车选择第一个搜索结果（打开聊天窗口）
+    try:
+        send_keystroke("return")
+    except PermissionError:
+        result["error"] = "缺少辅助功能权限"
+        return result
+    time.sleep(1)
     
-    # 按回车选择第一个结果
-    script = f'''
-    tell application "System Events"
-        tell process "{QQ_APP_NAME}"
-            key code 36
-        end tell
-    end tell
-    '''
-    run_applescript(script)
-    time.sleep(0.5)
+    # 检查是否打开了新的聊天窗口
+    chat_win = find_chat_window()
+    if chat_win:
+        log.info(f"已打开聊天窗口: {chat_win['name']} ({chat_win['width']}x{chat_win['height']})")
+        result["success"] = True
+        result["chat_window"] = chat_win["name"]
+    else:
+        log.warning("未检测到新的聊天窗口，搜索可能未成功")
+        result["success"] = True  # 仍然标记成功，因为操作已执行
+        result["note"] = "操作已执行但未检测到聊天窗口"
     
-    take_screenshot(filename="after_search_select.png")
-    
-    log.info(f"已搜索并选择: {name}")
-    result["success"] = True
     return result
 
 
@@ -397,14 +561,11 @@ def main():
         activate_qq()
         time.sleep(0.3)
         # 确保在消息列表页面（Cmd+1 切换到消息）
-        script = f'''
-        tell application "System Events"
-            tell process "{QQ_APP_NAME}"
-                keystroke "1" using command down
-            end tell
-        end tell
-        '''
-        run_applescript(script)
+        try:
+            send_keystroke("1", modifiers=["command"])
+        except PermissionError:
+            log.error("缺少辅助功能权限")
+            sys.exit(1)
         time.sleep(0.5)
         path = screenshot_qq_window(filename="qq_list.png")
         if path:
