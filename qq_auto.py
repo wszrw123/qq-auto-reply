@@ -25,6 +25,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import subprocess
 import sys
 import time
@@ -499,6 +500,201 @@ def search_contact(name: str) -> dict:
 
 
 # ============================================================
+# 消息监听与自动回复
+# ============================================================
+
+EVENT_FILE = LOG_DIR / "new_message_events.jsonl"
+
+
+def get_dock_badge() -> int:
+    """获取 QQ Dock 图标未读徽章数"""
+    script = '''
+    tell application "System Events"
+        tell process "Dock"
+            try
+                set dockItems to every UI element of list 1
+                repeat with dockItem in dockItems
+                    if name of dockItem is "QQ" then
+                        try
+                            set badgeText to value of attribute "AXStatusLabel" of dockItem
+                            if badgeText is not "" and badgeText is not missing value then
+                                return badgeText
+                            end if
+                        end try
+                        return "0"
+                    end if
+                end repeat
+            end try
+            return "0"
+        end tell
+    end tell
+    '''
+    result = run_applescript(script)
+    try:
+        return int(result)
+    except (ValueError, TypeError):
+        return 0
+
+
+def monitor_chat(
+    target: str = None,
+    auto_reply: str = None,
+    delay: float = 15.0,
+    jitter: float = 5.0,
+    poll_interval: float = 5.0,
+    max_replies: int = 0,
+    dry_run: bool = False,
+):
+    """监听 QQ 消息并自动回复
+
+    检测方式：
+      1. 监控 QQ 窗口列表变化（新聊天窗口出现 = 有人找你）
+      2. 监控 Dock 未读徽章数变化
+
+    Args:
+        target: 仅监听指定联系人的消息，None 则监听所有
+        auto_reply: 自动回复内容，None 则只记录事件不回复
+        delay: 回复延迟秒数（默认15秒）
+        jitter: 延迟随机抖动范围（默认±5秒）
+        poll_interval: 轮询间隔秒数（默认5秒）
+        max_replies: 最大回复次数，0=无限
+        dry_run: True 则只输入不发送
+    """
+    log.info("=" * 50)
+    log.info("QQ 消息监听已启动")
+    log.info(f"  监听目标: {target or '所有联系人'}")
+    log.info(f"  自动回复: {'是' if auto_reply else '否（仅记录事件）'}")
+    log.info(f"  回复延迟: {delay}s ± {jitter}s")
+    log.info(f"  轮询间隔: {poll_interval}s")
+    log.info(f"  最大回复: {max_replies or '无限'}")
+    log.info(f"  Dry-run:  {dry_run}")
+    log.info("=" * 50)
+    log.info("按 Ctrl+C 停止监听\n")
+
+    # 记录初始状态
+    known_windows = set()
+    for w in get_qq_windows():
+        known_windows.add(w["name"])
+    last_badge = get_dock_badge()
+    reply_count = 0
+    # 已回复的窗口（避免重复回复同一个人）
+    replied_windows = set()
+
+    try:
+        while True:
+            time.sleep(poll_interval)
+
+            if not is_qq_running():
+                log.warning("QQ 未运行，等待中...")
+                continue
+
+            # 检测 1: 新聊天窗口
+            current_windows = {}
+            for w in get_qq_windows():
+                current_windows[w["name"]] = w
+            current_names = set(current_windows.keys())
+            new_windows = current_names - known_windows - {"", "QQ", "全网搜索"}
+
+            # 检测 2: Dock 徽章变化
+            current_badge = get_dock_badge()
+            badge_increased = current_badge > last_badge
+
+            if new_windows or badge_increased:
+                if badge_increased:
+                    log.info(f"📬 检测到未读消息变化: {last_badge} → {current_badge}")
+                    last_badge = current_badge
+
+                for win_name in new_windows:
+                    if not win_name or win_name in ("QQ", "全网搜索"):
+                        continue
+
+                    # 如果指定了目标，只响应目标联系人
+                    if target and target not in win_name:
+                        log.info(f"  忽略非目标窗口: {win_name}")
+                        continue
+
+                    # 避免重复回复
+                    if win_name in replied_windows:
+                        log.info(f"  已回复过: {win_name}，跳过")
+                        continue
+
+                    log.info(f"📨 新消息来自: {win_name}")
+
+                    # 记录事件
+                    event = {
+                        "timestamp": datetime.now().isoformat(),
+                        "sender": win_name,
+                        "type": "new_chat_window",
+                        "replied": False,
+                    }
+
+                    if auto_reply:
+                        # 计算实际延迟
+                        actual_delay = max(1, delay + random.uniform(-jitter, jitter))
+                        log.info(f"  ⏳ 等待 {actual_delay:.1f} 秒后回复...")
+                        time.sleep(actual_delay)
+
+                        # 确保窗口仍然存在
+                        activate_qq()
+                        time.sleep(0.3)
+
+                        chat_win = None
+                        for w in get_qq_windows():
+                            if w["name"] == win_name:
+                                chat_win = w
+                                break
+
+                        if chat_win:
+                            raise_window(win_name)
+                            time.sleep(0.3)
+                            input_x = chat_win["x"] + chat_win["width"] // 2
+                            input_y = chat_win["y"] + int(chat_win["height"] * 0.85)
+                            pyautogui.click(input_x, input_y)
+                            time.sleep(0.3)
+
+                            try:
+                                paste_text(auto_reply)
+                                time.sleep(0.2)
+
+                                if not dry_run:
+                                    send_keystroke("return")
+                                    time.sleep(0.5)
+                                    log.info(f"  ✅ 已回复 {win_name}: {auto_reply[:30]}...")
+                                    event["replied"] = True
+                                    event["reply_message"] = auto_reply
+                                else:
+                                    log.info(f"  [DRY RUN] 已输入但未发送给 {win_name}")
+                                    event["replied"] = False
+                                    event["note"] = "dry_run"
+
+                                replied_windows.add(win_name)
+                                reply_count += 1
+
+                            except PermissionError:
+                                log.error("  缺少辅助功能权限")
+                                event["error"] = "缺少辅助功能权限"
+                        else:
+                            log.warning(f"  窗口 {win_name} 已关闭，跳过回复")
+                            event["error"] = "窗口已关闭"
+
+                    # 写入事件文件
+                    with open(EVENT_FILE, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+                    if max_replies and reply_count >= max_replies:
+                        log.info(f"已达到最大回复次数 ({max_replies})，停止监听")
+                        return
+
+            # 更新已知窗口
+            known_windows = current_names
+            last_badge = current_badge
+
+    except KeyboardInterrupt:
+        log.info("\n监听已停止")
+        log.info(f"共回复 {reply_count} 条消息")
+
+
+# ============================================================
 # 主入口
 # ============================================================
 
@@ -509,11 +705,12 @@ def main():
         epilog="""
 示例：
   python3 qq_auto.py open                         # 激活 QQ
-  python3 qq_auto.py read                         # 截取当前聊天截图
-  python3 qq_auto.py list                         # 截取会话列表
   python3 qq_auto.py search --name "张三"         # 搜索联系人
   python3 qq_auto.py reply --message "你好！"     # 发送消息
   python3 qq_auto.py reply --message "测试" --dry-run  # 只输入不发送
+  python3 qq_auto.py monitor -r "稍等，马上回复你"     # 监听并自动回复
+  python3 qq_auto.py monitor -t "find!" -r "收到" --delay 10  # 指定联系人
+  python3 qq_auto.py monitor --max-replies 1 -r "在忙，稍后回复"  # 只回复一次
         """
     )
     
@@ -537,6 +734,16 @@ def main():
     p_reply = sub.add_parser("reply", help="在当前聊天窗口发送消息")
     p_reply.add_argument("--message", "-m", required=True, help="要发送的消息内容")
     p_reply.add_argument("--dry-run", action="store_true", help="只输入不发送")
+    
+    # monitor 命令
+    p_mon = sub.add_parser("monitor", help="监听 QQ 消息并自动回复")
+    p_mon.add_argument("--target", "-t", help="仅监听指定联系人（包含匹配），不指定则监听所有")
+    p_mon.add_argument("--auto-reply", "-r", help="自动回复内容，不指定则仅记录事件")
+    p_mon.add_argument("--delay", type=float, default=15.0, help="回复延迟秒数（默认15秒）")
+    p_mon.add_argument("--jitter", type=float, default=5.0, help="延迟随机抖动范围±秒（默认5秒）")
+    p_mon.add_argument("--poll", type=float, default=5.0, help="轮询间隔秒数（默认5秒）")
+    p_mon.add_argument("--max-replies", type=int, default=0, help="最大回复次数，0=无限（默认0）")
+    p_mon.add_argument("--dry-run", action="store_true", help="只输入不发送")
     
     args = parser.parse_args()
     
@@ -593,13 +800,25 @@ def main():
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
     
+    elif args.command == "monitor":
+        monitor_chat(
+            target=args.target,
+            auto_reply=args.auto_reply,
+            delay=args.delay,
+            jitter=args.jitter,
+            poll_interval=args.poll,
+            max_replies=args.max_replies,
+            dry_run=args.dry_run,
+        )
+    
     else:
         parser.print_help()
         print("\n快速开始:")
         print("  python3 qq_auto.py open            # 激活 QQ")
-        print("  python3 qq_auto.py read            # 截取聊天窗口")
         print("  python3 qq_auto.py search --name '张三'  # 搜索联系人")
         print("  python3 qq_auto.py reply -m '你好'  # 发送消息")
+        print("  python3 qq_auto.py monitor -r '稍等，马上回复你'  # 自动回复")
+        print("  python3 qq_auto.py monitor -t 'find!' -r '收到' --delay 10  # 指定联系人")
 
 
 if __name__ == "__main__":

@@ -66,6 +66,47 @@ python3 qq_auto.py reply --message "测试内容" --dry-run
 | `search --name <名称>` | 搜索联系人/群聊并打开对话 |
 | `reply --message <内容>` | 在当前聊天窗口发送消息 |
 | `reply --message <内容> --dry-run` | 只输入不发送（测试用） |
+| `monitor -r <回复内容>` | 监听新消息并自动回复 |
+| `monitor -t <联系人> -r <回复内容>` | 仅监听指定联系人 |
+
+### monitor 参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--target, -t` | 仅监听指定联系人（包含匹配） | 所有联系人 |
+| `--auto-reply, -r` | 自动回复内容，不指定则仅记录事件 | 无 |
+| `--delay` | 回复延迟秒数 | 15 |
+| `--jitter` | 延迟随机抖动范围±秒 | 5 |
+| `--poll` | 轮询间隔秒数 | 5 |
+| `--max-replies` | 最大回复次数，0=无限 | 0 |
+| `--dry-run` | 只输入不发送 | false |
+
+### 监听示例
+
+```bash
+# 监听所有消息，自动回复
+python3 qq_auto.py monitor -r "稍等，马上回复你"
+
+# 只监听 find! 的消息，10秒后回复
+python3 qq_auto.py monitor -t "find!" -r "收到，稍后回复" --delay 10
+
+# 只回复一次
+python3 qq_auto.py monitor --max-replies 1 -r "在忙，稍后回复"
+
+# 仅记录事件不回复（供 agent 处理）
+python3 qq_auto.py monitor
+```
+
+### 检测机制
+
+1. **窗口监控**：每5秒检查 QQ 窗口列表，新聊天窗口出现 = 有人找你
+2. **Dock 徽章**：监控 QQ Dock 图标未读徽章数变化
+
+### 回复延迟建议
+
+- 默认 15秒 ± 5秒随机抖动（实际10~20秒），自然不显机器人
+- 快速回复：`--delay 5 --jitter 2`（3~7秒）
+- 慢速回复：`--delay 30 --jitter 10`（20~40秒）
 
 ## Agent 使用示例
 
